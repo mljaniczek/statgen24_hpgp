@@ -1,0 +1,533 @@
+---
+title: "HPGP Analysis"
+author: "Margaret Janiczek"
+date: "2024-04-21"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(gtsummary)
+library(genetics)
+```
+
+```{r}
+# download data
+hpgpURL <- "http://people.umass.edu/ouyanglab/data/HPGP.data.txt"
+hpgp <- read.delim (file=hpgpURL, header=T, sep="\t")
+```
+
+# Data exploration
+
+Originally there were 629 subjects, 5000 SNPs, and several features such as astigmatism, high triglycerides, gender weight and height.
+
+```{r}
+hpgp %>%
+  dplyr::select(High_triglycerides:Height) %>%
+  tbl_summary()
+```
+
+As we can see there are 231 subjects missing values for astygmatism. I am going to exclude them from our analysis dataset. Additionally, there were 10 subjects that were missing >75% of SNP data so they will be excluded as well. This results in a sample size of 388 subjects.
+
+In the below table we can see the distribution of gender and myopia stratified by presence of astigmatism (1) vs no astigmatism (0).
+
+
+```{r}
+# first just grab out the 
+snps <- hpgp %>%
+  filter(!is.na(Astigmatism)) %>%
+  dplyr::select(-c(High_triglycerides:Height))
+
+# calculate percent of SNP missingness for rows (subjects)
+rowna_percent <- rowMeans(is.na(snps))
+
+# make index for if subject is missing more than 75% of SNP data
+index_row <- rowna_percent >.75
+
+index_cols <- colMeans(is.na(snps)) >.4  # there were no SNPs that were missing more than 95% of data
+
+# now make final set of patient data to prepare for SNP processing
+hpgp2 <- hpgp %>%
+  filter(!is.na(Astigmatism)) 
+
+hpgp3 <- hpgp2[!index_row,] # get rid of the subjects with NA percent above threshold
+
+covars <- hpgp3 %>%
+  dplyr::select(c(ID, High_triglycerides:Height))
+
+covars %>%
+  dplyr::select(Astigmatism, Myopia, Gender, Weight, Height) %>%
+  tbl_summary(by = Astigmatism) %>%
+  add_overall() %>%
+  add_p() 
+
+```
+
+
+Next I calculated the percent of SNPs which had missingness. No SNPs were missing >75% of values, so we didn't need to filter out any SNPs for missingness. Finally, calculated the minor allele frequency (MAF) for all SNPs and excluded SNPs with MAF <5% for a final count of 4789 SNPs.
+
+```{r}
+snps2 <- hpgp3 %>% 
+  dplyr::select(-c(High_triglycerides:Height))
+
+snp_percents <- snps2 %>%
+  pivot_longer(!c(ID), names_to = "snps_of_interest") %>%
+  # now nest the data by snp so each snp has it's own data matrix
+  nest(.by = snps_of_interest) %>%
+  # finally get p-value from t test for each by using purrr::map function
+  # note map_dbl makes the result into a vector instead of a list, nice for presentation
+  mutate(
+    # first figure out the minor allele for each snp
+    minor_allele = purrr::map_chr(data, ~allele.names (genotype (.x$value,
+  sep="", reorder="freq"))[2])) %>%
+  mutate(
+    data = map2(data, minor_allele, function(.x, .y){
+      .x %>%
+        # now recode to make a binary variable where its 1 if the subject has minor allele
+      mutate(val_recode = as.numeric(str_detect(.x$value, .y)))
+    }))
+
+snp_percents <- snp_percents %>%
+  # calculate minor allele frequency per snp
+  mutate(maf_pct = purrr::map_dbl(data, 
+                              ~sum(.x$val_recode, na.rm = TRUE)/sum(!is.na(.x$val_recode))))
+
+snp_select <- snp_percents %>%
+  filter(maf_pct >0.05)
+```
+
+
+Using this "final" (pending agreement on filtering) data, see below for the distribution of the remaining missingness. 
+
+Firs plot: distribution of missingness prior to processing the original 398 subjects and 5000 SNPs:
+
+```{r}
+# now filter for snps that have MAF > 5%
+library(visdat)
+
+
+
+vis_miss(snps, warn_large_data = FALSE, 
+                 cluster = FALSE)  +
+  theme(axis.text.x=element_blank())
+```
+
+And below is the distribution of remaining missingness in 388 subjects for 4789 SNPs:
+
+```{r}
+snps3 <- snps2 %>%
+  dplyr::select(c(snp_select$snps_of_interest)) 
+
+
+vis_miss(snps3, warn_large_data = FALSE, 
+                 cluster = FALSE) +
+  theme(axis.text.x=element_blank())
+
+# finally run PCA to see if there is pop substructure
+snp_num <- data.matrix(snps3)
+snp_num[is.na(snp_num)] <- 4
+```
+
+# PCA
+
+There appears to be some population substructure. However I'm not sure what it is related to in this dataset, since most of the variables are binary but this has 3 distinct groups. 
+
+```{r}
+
+# PCA
+pc_res<- prcomp(snp_num)
+
+df_out <- as.data.frame(pc_res$x)
+df_out$gender <- as.factor(covars$Gender)
+df_out$astigmatism <- as.factor(covars$Astigmatism)
+
+ggplot(df_out, aes(x = PC1, y = PC2,
+                   color = astigmatism, alpha = 0.6)) +
+  geom_point() +
+  theme_bw() +
+  ggtitle("PCA PC1 vs PC2") +
+  labs(color = "astigmatism") +
+  scale_alpha(guide = 'none')
+
+ggplot(df_out, aes(x = PC1, y = PC2,
+                   color = gender, alpha = 0.6)) +
+  geom_point() +
+  theme_bw() +
+  ggtitle("PCA PC1 vs PC2") +
+  labs(color = "gender") +
+  scale_alpha(guide = 'none')
+```
+
+
+
+
+
+
+
+
+
+```{r}
+
+Trait_asti<-hpgp3$Astigmatism
+
+# define a function to conduct Chi-squared test
+myChiSqTest <- function (Geno) {
+  ObsTab <- table (Trait_asti,Geno)
+  return (chisq.test(ObsTab)$p.value)
+}
+
+# define a function to conduct Fisher's exact test
+myfishertest <- function (Geno) {
+  ObsTab <- table (Trait_asti,Geno)
+  return (fisher.test(ObsTab)$p.value)
+}
+
+```
+
+
+```{r}
+# define a function to choose whether 
+# the Chi-squared test or Fisher's exact test
+
+Trait_asti<-hpgp3$Astigmatism
+
+myChiSqTest_fishertest<- function (Geno){
+  
+  ObsTab <- table (Trait_asti,Geno)
+  
+  if((sum(ObsTab<5)/length(ObsTab))>=0.2){
+    return (fisher.test(ObsTab)$p.value)
+  }
+  
+  else{return(chisq.test(ObsTab)$p.value)}
+
+}
+```
+
+
+```{r}
+# perform the tests for all SNPs
+
+p_vec<-sort(apply(snps3,2,myChiSqTest_fishertest))
+head(p_vec)
+```
+
+```{r}
+# number of significant SNPs (alpha = 0.05)
+sum(p_vec<0.05)
+length(p_vec[p_vec<0.05])
+
+
+```
+
+```{r}
+# subset of data based on assoc < 0.05
+index_snps <- (p_vec<0.05)
+snps4 <- snps3[,index_snps]
+
+
+```
+
+
+
+
+
+
+```{r}
+# random forest
+library(randomForest)
+
+dat_rf <- snps3 %>%
+  #dplyr::select(-ID) %>%
+  mutate(astig = as.factor(hpgp3$Astigmatism),
+         myopia = as.factor(hpgp3$Myopia),
+         gender = hpgp3$Gender)
+
+library(rpart)
+# rpart 
+classTree <- rpart (astig ~ .,
+method="class", data=dat_rf)
+
+
+dat_num <- as.data.frame(data.matrix(dat_rf))
+
+dat_rf[is.na(dat_rf)] <- 4 
+
+rf_res <- randomForest(astig ~., dat_rf)
+
+rf_res
+
+varImpPlot(rf_res, n.var = 10, main = "Variable Importance Plot")
+
+plot(rf_res)
+
+# rf using pcs 
+
+pc_df <- df_out %>%
+  dplyr::select(PC1:PC5) %>%
+  mutate(astig = as.factor(hpgp3$Astigmatism), 
+         gender)
+rf_res_pc <- randomForest(astig ~., pc_df)
+
+rf_res_pc
+
+var_imp <- rf_res$importance %>%
+  as_tibble(rownames = "SNP") %>%
+  mutate(mean_decrease_gini_abs = abs(MeanDecreaseGini)) %>%
+  arrange(desc(mean_decrease_gini_abs))
+
+
+snp_sub <- snps3 %>% dplyr::select(head(var_imp, 10)$SNP) %>%
+  mutate(astigmatism = as.factor(hpgp3$Astigmatism)) %>%
+  pivot_longer(!astigmatism) %>%
+  drop_na
+
+
+snp_sub1 <- snp_sub %>%
+  filter(value == "AC")
+
+snp_sub2 <- snp_sub %>%
+  filter(value == "AG") 
+
+snp_sub3 <- snp_sub %>%
+  filter(value == "GT" | value == "CT")
+
+
+ggplot(snp_sub %>% filter(name %in% snp_sub1$name), aes(astigmatism, fill = value)) +
+  geom_bar(position = "fill") +
+  facet_wrap(name ~., ncol = 1)
+
+ggplot(snp_sub %>% filter(name %in% snp_sub2$name), aes(value, fill = astigmatism)) +
+  geom_bar() +
+  facet_wrap(name ~., ncol = 1)
+
+ggplot(snp_sub %>% filter(name %in% snp_sub3$name), aes(value, fill = astigmatism)) +
+  geom_bar() +
+  facet_wrap(name ~., ncol = 1)
+
+
+ggplot(snp_sub, aes(astigmatism, fill = value)) +
+  geom_bar(position = "fill") +
+  facet_wrap(name ~., ncol = 2) +
+  ylab("percentage")
+```
+
+```{r permutation}
+permutation_reps = 100
+set.seed(10)
+library(rfPermute)
+
+perm1 <- rfPermute(astig ~.,
+                   data = dat_rf,
+                   num.rep = permutation_reps)
+
+save(perm1, file = here::here("results/permutationres_05082024.Rdata"))
+
+
+load(here::here("results/permutationres_03172024.Rdata"))
+
+
+var_imp <- rfPermute::importance(perm1) %>%
+  as_tibble(rownames = "metabolite") %>%
+  janitor::clean_names() %>%
+  mutate(qval_mean_decrease_accuracy = p.adjust(mean_decrease_accuracy_pval, method = "fdr"),
+         qval_mean_decrease_gini = p.adjust(mean_decrease_gini_pval, method = "fdr")) %>%
+  arrange(qval_mean_decrease_gini) %>%
+  mutate(met_qval_cutoff = ifelse(
+    qval_mean_decrease_accuracy <0.05, "Yes", "No"
+  ))
+
+var_imp_sub <- var_imp %>%
+  filter(met_qval_cutoff == "Yes") %>%
+  head(10) %>%
+  mutate(`Method 2 Rank` = row_number())
+
+var_imp_full_sub <- var_imp_full %>%
+  head(10) %>%
+  mutate(`Method 1 Rank` = row_number())
+
+var_imp_total <- var_imp_full_sub %>%
+  select(metabolite, `Method 1 Rank`) %>%
+  full_join(var_imp_sub %>% select(metabolite, `Method 2 Rank`))
+
+#var_imp_total[is.na(var_imp_total)] <- "No"
+
+gt::gt(var_imp_total)
+
+```
+
+Let's examine the density plot of those top 10 listed in variable importance: 
+
+
+```{r out.width="100%"}
+dat_sub2 <- dat_sub_long %>%
+  filter(metabolite %in% head(var_imp$metabolite, n = 6)) %>%
+  group_by(metabolite) %>%
+  mutate(metabolite = paste0(str_sub(metabolite, start = 1L, end = 25L), "..."))
+
+ggplot(dat_sub2, aes(x=log_value, fill=disease_state)) +
+  geom_density(alpha=0.4) +
+  facet_wrap(~metabolite, ncol = 3) +
+  labs(fill = "") +
+  theme(legend.position = "bottom")
+
+ggsave("dens6better.png", width = 8, height = 6, units = "in")
+```
+
+```{r}
+training_proportion = 0.7
+iterations = 100
+set.seed(1219)
+library(tidymodels)
+
+auc <- c()
+err <- c()
+err_oob <- c()
+
+for (iter in 1:iterations) {
+  data_split <- initial_split(dat_rf, prop = training_proportion,
+                              strata = astig)
+  train_data <- training(data_split)
+  test_data <- testing(data_split)
+  mod_rf <- randomForest(astig ~., data = train_data)
+  pred_rf <- predict(mod_rf, test_data, type = "class")
+  roc_test <- pROC::roc(as.numeric(test_data$astig), as.numeric(pred_rf))
+  auc <- c(auc, pROC::auc(roc_test))
+  err <- rbind(err, mod_rf$confusion[,3])
+  err_oob <- c(err_oob, mod_rf$err.rate[500,1])
+}
+
+aucAll <- mean(auc, na.rm = FALSE)
+aucq25 <- quantile(auc, 0.025)
+aucq975 <- quantile(auc, 0.975)
+err_control <- mean(err[,"0"])
+err_case <- mean(err[,"1"])
+
+err_oobAll <- mean(err_oob)
+
+out <- data.frame('Comparison' = "Astigmatism vs Control",
+                  'AUC' = aucAll,
+                  'AUC 2.5' = aucq25,
+                  'AUC 97.5' = aucq975,
+                  'Error Rate of Control' = err_control,
+                  'Error Rate of Astigmatism' = err_case)
+
+out2 <- out %>%
+  mutate(AUC = paste0(round(AUC, 2), " (", round(AUC.2.5, 2), ", ", round(AUC.97.5, 2), ")"),
+         "Err. rate of Astigmatism" = round(Error.Rate.of.Astigmatism, 3),
+         "Err. rate of Control" = round(Error.Rate.of.Control,3)) %>%
+          dplyr::select(Comparison, AUC, `Err. rate of Astigmatism`, `Err. rate of Control`) 
+
+gt::gt(out2)
+```
+
+
+# lasso 
+
+```{r}
+library(glmnet)
+
+snps4_mat <- data.matrix(snps4)
+
+snps4_mat[is.na(snps4_mat)] <- 4
+
+cvfit <- cv.glmnet(snps4_mat, as.factor(hpgp3$Astigmatism), 
+                 family = "binomial",
+                 type.measure = "class")
+
+summary(cvfit)
+
+cvfit
+library(tidyverse)
+library(broom)
+
+tidied_cv <- tidy(cvfit)
+glance_cv <- glance(cvfit)
+
+tidied <- tidy(cvfit$glmnet.fit)
+
+# and plot them (but not the intercept)
+tidied %>%
+  filter(term != "(Intercept)") %>%
+ggplot( aes(lambda, estimate, group = term, color = term)) +
+  scale_x_log10() +
+  geom_line() +
+  geom_vline(xintercept = glance_cv$lambda.min) +
+  guides(color="none")
+```
+
+```{r}
+# this function will take your input of x and y and return tidy results from the minimum lambda cv result
+get_cv_result <- function(x, y){
+  cvfit <- cv.glmnet(x, y, 
+                 family = "binomial",
+                 type.measure = "class")
+  tidied_cv <- tidy(cvfit)
+  glance_cv <- glance(cvfit)
+  
+  tidied <- tidy(cvfit$glmnet.fit)
+  
+  allvars <- data.frame(term = colnames(x))
+  
+  tidied_min <- tidied %>%
+    filter(lambda == cvfit$lambda.min) %>%
+    right_join(allvars, by = "term") %>% #join to make sure you don't drop vars that went to zero in lasso estimation
+    dplyr::select(term, estimate) %>%
+    mutate(term = factor(term, levels= str_sort(term, numeric=TRUE))) %>%
+    arrange(term) %>%
+    replace(is.na(.), 0)
+  return(tidied_min)
+}
+
+# get tidy result from observed data
+observed_result <- get_cv_result(snps4_mat, as.factor(hpgp3$Astigmatism))
+
+# specify variable names and number of permutations
+variable_names <- colnames(snps4_mat)
+num_permutations = 100
+
+# set seed for reproducibility
+set.seed(1219)
+
+#set up loop for permutation results
+perm_results<-vector('list',num_permutations)
+perm_results_bigger <- vector('list',num_permutations)
+for(i in 1:num_permutations){
+  perm_y <- sample(hpgp3$Astigmatism)
+  res <- get_cv_result(snps4_mat, as.factor(hpgp3$Astigmatism))
+  test <- left_join(observed_result, res, 
+                  by = "term",
+                  suffix = c(".obs", ".perm")) %>%
+    # calculating if permuation estimate is greater than or equal to observed estimate
+    mutate(bigger = as.numeric(abs(estimate.perm) >= abs(estimate.obs)))
+  perm_results[[i]]<-res$estimate 
+  perm_results_bigger[[i]] <- test$bigger
+}
+```
+
+```{r}
+#make nice dataframe from results to present them
+final_results <- bind_cols(perm_results_bigger)  %>%
+  mutate(sum = rowSums(across(where(is.numeric))),
+         # calculate p-value which is sum of times that permuted val is >= observed value, divided by number of permutations
+         perm_pval = sum/num_permutations,
+         term = observed_result$term,
+         estimate = round(observed_result$estimate, 3)) %>%
+  dplyr::select(term, estimate, perm_pval) %>%
+  # and if you want to adjust for multiple testing you can do FDR correction like this, just specify the method. Here I'm using Benjamini Hochberg 
+  mutate(
+    qval = round(p.adjust(perm_pval, method = "BH"),2)
+  )
+
+# use gt to display results in a table
+gt::gt(head(final_results, 10))
+```
+
+
+
+
+

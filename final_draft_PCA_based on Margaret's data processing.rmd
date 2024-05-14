@@ -1,0 +1,472 @@
+---
+title: "final_draft"
+author: "Wenhao Jiang"
+date: "2024-04-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(gtsummary)
+library(genetics)
+library(stargazer)
+```
+
+
+#########
+
+```{r,message=FALSE,warning=FALSE}
+HPGPURL <- "http://people.umass.edu/ouyanglab/data/HPGP.data.txt"
+hpgp <- read.delim (file=HPGPURL, header=T, sep="\t")
+#library (genetics)
+```
+
+# Data exploration
+
+Originally there were 629 subjects, 5000 SNPs, and several features such as astigmatism, high triglycerides, gender weight and height.
+
+```{r}
+hpgp %>%
+  dplyr::select(High_triglycerides:Height) %>%
+  tbl_summary()
+```
+
+As we can see there are 231 subjects missing values for astygmatism. I am going to exclude them from our analysis dataset. Additionally, there were 10 subjects that were missing >75% of SNP data so they will be excluded as well. This results in a sample size of 388 subjects.
+
+In the below table we can see the distribution of gender and myopia stratified by presence of astigmatism (1) vs no astigmatism (0).
+
+
+```{r}
+# first just grab out the 
+snps <- hpgp %>%
+  filter(!is.na(Astigmatism)) %>%
+  dplyr::select(-c(High_triglycerides:Height))
+
+# calculate percent of SNP missingness for rows (subjects)
+rowna_percent <- rowMeans(is.na(snps))
+
+# make index for if subject is missing more than 75% of SNP data
+index_row <- rowna_percent >.75
+
+index_cols <- colMeans(is.na(snps)) >.7  # there were no SNPs that were missing more than 95% of data
+
+# now make final set of patient data to prepare for SNP processing
+hpgp2 <- hpgp %>%
+  filter(!is.na(Astigmatism)) 
+
+hpgp3 <- hpgp2[!index_row,] # get rid of the subjects with NA percent above threshold
+
+covars <- hpgp3 %>%
+  dplyr::select(c(ID, High_triglycerides:Height))
+
+covars %>%
+  dplyr::select(Astigmatism, Myopia, Gender, Weight, Height) %>%
+  tbl_summary(by = Astigmatism) %>%
+  add_overall() %>%
+  add_p() 
+
+```
+
+
+Next I calculated the percent of SNPs which had missingness. No SNPs were missing >75% of values, so we didn't need to filter out any SNPs for missingness. Finally, calculated the minor allele frequency (MAF) for all SNPs and excluded SNPs with MAF <5% for a final count of 4789 SNPs.
+
+```{r}
+snps2 <- hpgp3 %>% 
+  dplyr::select(-c(High_triglycerides:Height))
+
+snp_percents <- snps2 %>%
+  pivot_longer(!c(ID), names_to = "snps_of_interest") %>%
+  # now nest the data by snp so each snp has it's own data matrix
+  nest(.by = snps_of_interest) %>%
+  # finally get p-value from t test for each by using purrr::map function
+  # note map_dbl makes the result into a vector instead of a list, nice for presentation
+  mutate(
+    # first figure out the minor allele for each snp
+    minor_allele = purrr::map_chr(data, ~allele.names (genotype (.x$value,
+  sep="", reorder="freq"))[2])) %>%
+  mutate(
+    data = map2(data, minor_allele, function(.x, .y){
+      .x %>%
+        # now recode to make a binary variable where its 1 if the subject has minor allele
+      mutate(val_recode = as.numeric(str_detect(.x$value, .y)))
+    }))
+
+snp_percents <- snp_percents %>%
+  # calculate minor allele frequency per snp
+  mutate(maf_pct = purrr::map_dbl(data, 
+                              ~sum(.x$val_recode, na.rm = TRUE)/sum(!is.na(.x$val_recode))))
+
+snp_select <- snp_percents %>%
+  filter(maf_pct >0.05)
+```
+
+
+Using this "final" (pending agreement on filtering) data, see below for the distribution of the remaining missingness. 
+
+Firs plot: distribution of missingness prior to processing the original 398 subjects and 5000 SNPs:
+
+```{r}
+# now filter for snps that have MAF > 5%
+library(visdat)
+
+
+
+vis_miss(snps, warn_large_data = FALSE, 
+                 cluster = FALSE)  +
+  theme(axis.text.x=element_blank())
+```
+
+And below is the distribution of remaining missingness in 388 subjects for 4789 SNPs:
+
+```{r}
+snps3 <- snps2 %>%
+  dplyr::select(c(snp_select$snps_of_interest)) 
+
+
+vis_miss(snps3, warn_large_data = FALSE, 
+                 cluster = FALSE) +
+  theme(axis.text.x=element_blank())
+
+# finally run PCA to see if there is pop substructure
+snp_num <- data.matrix(snps3)
+snp_num[is.na(snp_num)] <- 4
+```
+
+# PCA
+
+There appears to be some population substructure. However I'm not sure what it is related to in this dataset, since most of the variables are binary but this has 3 distinct groups. 
+
+```{r}
+
+# PCA
+pc_res<- prcomp(snp_num)
+
+df_out <- as.data.frame(pc_res$x)
+df_out$gender <- as.factor(covars$Gender)
+df_out$astigmatism <- as.factor(covars$Astigmatism)
+
+ggplot(df_out, aes(x = PC1, y = PC2,
+                   color = astigmatism, alpha = 0.6)) +
+  geom_point() +
+  theme_bw() +
+  ggtitle("PCA PC1 vs PC2") +
+  labs(color = "astigmatism") +
+  scale_alpha(guide = 'none')
+
+ggplot(df_out, aes(x = PC1, y = PC2,
+                   color = gender, alpha = 0.6)) +
+  geom_point() +
+  theme_bw() +
+  ggtitle("PCA PC1 vs PC2") +
+  labs(color = "gender") +
+  scale_alpha(guide = 'none')
+```
+
+
+```{r}
+
+# PCA (by correlation matrix)
+pc_res<- prcomp(snp_num,scale. = T)
+
+df_out <- as.data.frame(pc_res$x)
+df_out$gender <- as.factor(covars$Gender)
+df_out$astigmatism <- as.factor(covars$Astigmatism)
+
+ggplot(df_out, aes(x = PC1, y = PC2,
+                   color = astigmatism, alpha = 0.6)) +
+  geom_point() +
+  theme_bw() +
+  ggtitle("PCA PC1 vs PC2") +
+  labs(color = "astigmatism") +
+  scale_alpha(guide = 'none')
+
+ggplot(df_out, aes(x = PC1, y = PC2,
+                   color = gender, alpha = 0.6)) +
+  geom_point() +
+  theme_bw() +
+  ggtitle("PCA PC1 vs PC2") +
+  labs(color = "gender") +
+  scale_alpha(guide = 'none')
+```
+
+
+# Univariate analysis (chi-squared or fisher's, and adjusted by Q-value)
+
+```{r}
+
+Trait_asti<-hpgp3$Astigmatism
+
+# define a function to conduct Chi-squared test
+myChiSqTest <- function (Geno) {
+  ObsTab <- table (Trait_asti,Geno)
+  return (chisq.test(ObsTab)$p.value)
+}
+
+# define a function to conduct Fisher's exact test
+myfishertest <- function (Geno) {
+  ObsTab <- table (Trait_asti,Geno)
+  return (fisher.test(ObsTab)$p.value)
+}
+
+```
+
+
+```{r}
+# define a function to choose whether 
+# the Chi-squared test or Fisher's exact test
+
+Trait_asti<-hpgp3$Astigmatism
+
+myChiSqTest_fishertest<- function (Geno){
+  
+  ObsTab <- table (Trait_asti,Geno)
+  
+  if((sum(ObsTab<5)/length(ObsTab))>=0.2){
+    return (fisher.test(ObsTab)$p.value)
+  }
+  
+  else{return(chisq.test(ObsTab)$p.value)}
+
+}
+```
+
+
+```{r}
+# perform the tests for all SNPs
+
+p_vec<-apply(snps3,2,myChiSqTest_fishertest)
+head(p_vec)
+```
+
+```{r}
+# number of significant SNPs (alpha = 0.05)
+sum(p_vec<0.05)
+length(p_vec[p_vec<0.05])
+```
+
+```{r}
+# number of significant SNPs (alpha = 0.01)
+sum(p_vec<0.01)
+length(p_vec[p_vec<0.01])
+```
+
+```{r}
+# number of significant SNPs (alpha = 0.001)
+sum(p_vec<0.001)
+length(p_vec[p_vec<0.001])
+```
+
+## control the Type 1 error
+
+```{r}
+# bonferroni
+p_vec_adj<-p.adjust(p_vec, method="bonferroni")
+
+# number of significant SNPs after the control
+sum(p_vec_adj<0.05)
+```
+
+```{r}
+range(p_vec_adj)
+```
+
+```{r}
+# controlling for Type 1 error inflation using Q Value method with boostrap
+library(qvalue)
+q <- qvalue(p_vec, pi0.method="bootstrap")
+qVal <- q$qvalues
+head(qVal)
+# number of significant SNPs after the control
+sum(qVal<0.05)
+```
+
+```{r}
+range(qVal)
+```
+
+
+# Assess association between Astigmatism and Gender, and Astigmatism and Myopia.
+
+```{r}
+# gender
+table(hpgp3$Astigmatism,hpgp3$Gender)
+
+chisq.test(table(hpgp3$Astigmatism,hpgp3$Gender))
+```
+
+
+```{r}
+# Myopia
+table(hpgp3$Astigmatism,hpgp3$Myopia)
+
+chisq.test(table(hpgp3$Astigmatism,hpgp3$Myopia))
+```
+
+```{r}
+# logistic for Myopia and Gender
+model_logit <- glm(Astigmatism ~ Myopia+Gender,
+  data = hpgp3,
+  family = binomial(link = "logit")
+)
+
+summary(model_logit)
+```
+
+
+# May explore a model including all SNPs identified as associated with astigmatism
+
+## BY PCA
+
+```{r}
+###  By PCA
+head(which(p_vec<0.05))
+```
+
+```{r}
+## select the 232 significant SNPs
+snps3_significant<-snps3[,which(p_vec<0.05)]
+```
+
+```{r}
+## PCA
+snp_num3 <- data.matrix(snps3_significant)
+snp_num3[is.na(snp_num3)] <- 4
+
+```
+
+
+```{r}
+pc_res<- prcomp(snp_num3)
+
+df_out <- as.data.frame(pc_res$x)
+df_out$gender <- as.factor(covars$Gender)
+df_out$astigmatism <- as.factor(covars$Astigmatism)
+
+ggplot(df_out, aes(x = PC1, y = PC2,
+                   color = astigmatism, alpha = 0.6)) +
+  geom_point() +
+  theme_bw() +
+  ggtitle("PCA PC1 vs PC2") +
+  labs(color = "astigmatism") +
+  scale_alpha(guide = 'none')
+
+ggplot(df_out, aes(x = PC1, y = PC2,
+                   color = gender, alpha = 0.6)) +
+  geom_point() +
+  theme_bw() +
+  ggtitle("PCA PC1 vs PC2") +
+  labs(color = "gender") +
+  scale_alpha(guide = 'none')
+```
+
+
+```{r}
+pc_res<- prcomp(snp_num3,scale. = T)
+
+df_out <- as.data.frame(pc_res$x)
+df_out$gender <- as.factor(covars$Gender)
+df_out$astigmatism <- as.factor(covars$Astigmatism)
+
+ggplot(df_out, aes(x = PC1, y = PC2,
+                   color = astigmatism, alpha = 0.6)) +
+  geom_point() +
+  theme_bw() +
+  ggtitle("PCA PC1 vs PC2") +
+  labs(color = "astigmatism") +
+  scale_alpha(guide = 'none')
+
+ggplot(df_out, aes(x = PC1, y = PC2,
+                   color = gender, alpha = 0.6)) +
+  geom_point() +
+  theme_bw() +
+  ggtitle("PCA PC1 vs PC2") +
+  labs(color = "gender") +
+  scale_alpha(guide = 'none')
+```
+
+```{r}
+library("FactoMineR")
+library("factoextra")
+```
+
+```{r}
+# cumulative proportion of variance explained
+draw_cumu<-function(a,b,cc){
+  a_eig<-get_eigenvalue(a)
+  a_eig2<-a_eig[1:4,]
+  a_eig2$Dimensions<-seq(1:4)
+  a_eig2$cumulative_proportion<-round(a_eig2$cumulative.variance.percent,2)
+  ggplot(a_eig2, aes(x = Dimensions, y = cumulative_proportion )) +
+  geom_bar(stat = "identity", fill = "lightblue", colour = "black")+geom_text(aes(label = cumulative_proportion),color = "black",vjust = 1.5)+ggtitle(paste(b,cc,sep = ''))+scale_x_continuous(breaks=seq(-1,5,1))
+}
+```
+
+```{r}
+draw_cumu(pc_res,
+          'cumulative proportion of variance explained',
+          '_by first 4 PCs')
+```
+
+```{r}
+# threshold 0.75
+a_eig<-get_eigenvalue(pc_res)
+min(which(a_eig$cumulative.variance.percent>70))
+```
+
+```{r}
+# extract PCs
+PCs_df<-df_out[,1:10]
+a_eig$cumulative.variance.percent[10]
+```
+
+```{r}
+# combine the data frame
+covars_pcs<-cbind(covars[,c(6,8,15)],PCs_df)
+
+# perform the logistic model with PCs
+
+model_logit2 <- glm(Astigmatism ~ .,
+  data = covars_pcs,
+  family = binomial(link = "logit")
+)
+
+summary(model_logit2)
+
+```
+
+```{r}
+stargazer(model_logit,type = 'text')
+```
+
+```{r}
+## consider the interaction between Myopia and the PCs
+covars_pcs$mypc1<-covars_pcs$Myopia*covars_pcs$PC1
+covars_pcs$mypc2<-covars_pcs$Myopia*covars_pcs$PC2
+covars_pcs$mypc3<-covars_pcs$Myopia*covars_pcs$PC3
+covars_pcs$mypc4<-covars_pcs$Myopia*covars_pcs$PC4
+covars_pcs$mypc5<-covars_pcs$Myopia*covars_pcs$PC5
+
+covars_pcs$mypc6<-covars_pcs$Myopia*covars_pcs$PC6
+covars_pcs$mypc7<-covars_pcs$Myopia*covars_pcs$PC7
+covars_pcs$mypc8<-covars_pcs$Myopia*covars_pcs$PC8
+covars_pcs$mypc9<-covars_pcs$Myopia*covars_pcs$PC9
+covars_pcs$mypc10<-covars_pcs$Myopia*covars_pcs$PC10
+
+## interaction between gender and myopia
+#covars_pcs$myge<-covars_pcs$Myopia*covars_pcs$Gender
+```
+
+```{r}
+# perform the logistic model with interactions
+
+model_logit3 <- glm(Astigmatism ~ .,
+  data = covars_pcs,
+  family = binomial(link = "logit")
+)
+
+summary(model_logit3)
+
+```
+
+
